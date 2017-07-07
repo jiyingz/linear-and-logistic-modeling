@@ -1,0 +1,497 @@
+---
+title: "Voting Behavior"
+author: "An Explanatory Model"
+date: "Jiying Zou"
+output: pdf_document
+---
+
+```{r, include = F}
+library(DataComputing)
+require(RColorBrewer)
+library(leaps)
+library(glmnet)
+library(cvTools)
+```
+
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Load data
+vote <- read.csv("~/Documents/stat151/finalproj/vote.data.txt", sep = "")
+```
+
+##Introduction
+
+Political candidates receive support from both those supporting their visions and from those identifying with them culturally. To what extent will a voter’s race, income level, and geographical location influence their vote? Will Hispanics support a Black candidate similarly as minority groups do? This project builds and evaluates an explanatory model for voting behavior in the 1988 Democratic presidential primary election. Candidates include a Black minister, Jesse Jackson, and three White candidates. Results show that Black voters have 31 times higher odds of voting for Jackson, while Hispanics support Jackson to a lesser degree. Furthermore, support for Jackson varies over precincts and income levels.
+
+##Data Description
+
+The dataset used comes from an exit poll held by the Field Research Corporation, a private research firm performing consulting work for government interests. The poll surveyed 1867 voters on race, income level, precinct of residence, and candidate supported. Five racial groups, coded 1-5, are White, Hispanic, Black, Asian, and other. Eight income groups are coded 1-8 and represent $0-10k, $10-20k, $20-30k, $30-40k, $40-50k, $50-60k, $60-70k, and $70k+ annual income. Thirty-nine precincts are represented. Since sampling methods are unknown, the data is treated as representative of the entire small city population.
+
+Zeroes in the dataset are replaced with N/A’s, representing missing data. Only race and income variables had missing values. The eight individuals missing both values are removed due to lack of information. Remaining missing values are distributed reasonably evenly throughout race and income groups and represent <10% of all cases, so removal should not skew results noticeably.
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Which cols contain missing data
+sum(vote$precinct == 0)
+sum(vote$candidate == 0)
+sum(vote$race == 0)
+sum(vote$income == 0)
+
+length(which(vote$race == 0 & vote$income == 0)) #number of cases missing both race and income
+
+vote <- vote[-which(vote$race == 0 & vote$income == 0),] #remove cases
+
+#Distribution of missing income data
+tally(vote$income[which(vote$race == 0)])
+tally(vote$race[which(vote$income == 0)])
+c(0, tally(vote$race[which(vote$income == 0)]))/tally(vote$race) #percentage of each race
+```
+
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Replace the 0's with NA's
+vote$income <- replace(vote$income, which(vote$income == 0), NA)
+vote$race <- replace(vote$race, which(vote$race == 0), NA)
+
+#Remove rows with NA's
+na_ind <- unique(c(which(is.na(vote$race)), which(is.na(vote$income)))) #indexes of rows containing NA's
+vote <- vote[-na_ind, ] #remove rows
+sum(is.na(vote)) #sanity check -- no NAs
+
+length(unique(vote$precinct)) #number of precincts
+
+#Create indicator variable for whether or not they voted for Jackson
+vote$jackson <- (vote$candidate == 1) - 0
+sum(is.na(vote$jackson)) #yay no missing response data
+```
+
+Each variable is treated categorically, with numerical values representing individual groups. Figure 1 shows that the percentage of each income group supporting the Black candidate decreases as we move up in annual income categories. Different races support Jackson to differend degrees, and these proportions vary by precinct (Figure 2). In fact, some precincts have data missing on certain races' voting preferences.
+
+```{r, echo = FALSE, fig.height = 2, fig.width = 4.5, fig.align = 'center'}
+#Percentage of each income group voting for Jackson
+vote %>% 
+  group_by(income) %>%
+  summarise(percentvote = sum(jackson)/n()) %>%
+  ggplot(na.rm = TRUE) +
+  geom_tile(aes(x = income, y = percentvote)) +
+  labs(title = "Proportion of Income Groups Voting for Jackson", x = "Income Level", y = "% for Jackson") + 
+  scale_x_continuous("Income Level", 1:8)
+```
+Figure 1. Over half of those with annual income $0-10k voted for Jackson, and this percentage generally decreases as annual income increases. (Annual income group coding: 1 = \$0-10k, 2 = \$10-20k, 3 = \$20-30k, 4 = \$30-40k, 5 = \$40-50k, 6 = \$50-60k, 7 = \$60-70k, and 8 = \$70k+ annual income)
+
+
+```{r, echo = FALSE, fig.width = 7.5, fig.height = 5, fig.align = 'center'}
+#Percentage of each racial group voting for Jackson in each precinct
+vote %>%
+  group_by(Race = factor(race, labels=c("White", "Hispanic", "Black", "Asian", "Other")), precinct) %>%
+  summarise(percent = sum(jackson)/n()) %>%
+  ggplot(aes(x = Race, y = percent), na.rm = TRUE) +
+  geom_point(aes(col = Race)) +
+  facet_wrap(~ as.factor(precinct)) +
+  theme(axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.text.x = element_blank()) +
+  ylab("Proportion Voting for Jackson")+
+  labs(title = "Proportion of Race Voting for Jackson (by Precinct)")
+```
+
+\begin{center}
+\footnotesize Figure 2. The percentage of each racial group voting for Black candidate Jackson shows some variation across different precincts. White voters consistently tend not to vote for Jackson, while most Black voters do. Some precincts, such as 11, 25, 31, 43, and 84, are missing data on some races. Note: low numbers of individuals present in some racial groups in precincts may skew proportions.
+\end{center}
+
+The mosaic plot explores income distribution within and between races (Figure 3). White voters make up the sample's largest gorup; those sampled in this group have a rather uniform annual income distribution. The second largest group is Black, whose annual incomes tend to fall in the lower ranges (\$0 to \$30k per year). Other minority groups also are underrepresented amongst higher incomes. 
+
+```{r, echo = FALSE, fig.width = 6, fig.height = 3.5, fig.align = 'center'}
+#Mosaic Plot b/t race and income
+mosaicplot(table(vote$race, vote$income),
+           main = "Race and Income Group Composition", ylab = "Income Group", xlab = "Race")
+```
+
+\begin{center}
+\footnotesize Figure 3. Visualizing imbalances in the sample's racial and income group compositions. Black individuals (3) are overrepresented in the lowest three income groups, which indicate \$0-30k annual income. There are very few Asian (4) and other (5) race individuals in the sample. (Race groups coded: 1 = White, 2 = Hispanic, 3 = Black, 4 = Asian, 5 = Other)
+\end{center}
+
+Visualizing the relationship between race, income, and chance of voting for Jackson illustrates that black individuals across all income groups tend to vote for the black candidate, while income groups individually have almost an even split the votes The two variables do not seem to interact very much (Figure 4). 
+
+```{r, echo = FALSE, fig.width = 7, fig.height = 4.5, fig.align = 'center'}
+#Jittered logistic scatterplot
+tcol = paste( brewer.pal(9, "Set1")[ c(1:5)], "76", sep = "")
+plot(jitter(jackson, 1.5) ~ jitter(income,1.5), data  = vote, 
+     ylab = "Voted for Jackson", main = "Race and Income Groups Voting for Jackson", xlab = "Income Level", col = alpha(race, 0.3), 
+     pch = 19, bty = 'L', xlim = c(0,9.5), xaxt = 'n', yaxt = 'n')
+axis(side = 1, at = c(1:8), labels = c(1:8))
+axis(side = 2, at = c(0,1), labels = c("No", "Yes"))
+par(xpd=TRUE)
+legend(8.5, 0.8, legend = c("White", "Hispanic", "Black", "Asian", "Other"), fill = tcol)
+```
+
+\begin{center} 
+\footnotesize Figure 4. Lower income groups and Black individuals exhibit a larger chance of voting for Black candidate Jackson. The plot is jittered about income levels and responses to avoid overplotting. (Annual income group coding: 1 = \$0-10k, 2 = \$10-20k, 3 = \$20-30k, 4 = \$30-40k, 5 = \$40-50k, 6 = \$50-60k, 7 = \$60-70k, and 8 = \$70k+ annual income)
+\end{center}
+
+##Main Results
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+##MODEL BUILDING
+
+#Intercept model
+int_model <- glm(jackson ~ 1, data = vote, family = "binomial")
+
+#Univariate models
+lm1 <- glm(jackson ~ as.factor(race), data = vote, family = "binomial")
+lm2 <- glm(jackson ~ as.factor(income), data = vote, family = "binomial")
+lm3 <- glm(jackson ~ as.factor(precinct), data = vote, family = "binomial") 
+
+#Bivariate models
+lm4 <- glm(jackson ~ as.factor(race) + as.factor(income), data = vote, family = "binomial")
+lm5 <- glm(jackson ~ as.factor(race) + as.factor(precinct), data = vote, family = "binomial")
+lm6 <- glm(jackson ~ as.factor(income) + as.factor(precinct), data = vote, family = "binomial")
+
+#Trivariate model
+lm7 <- glm(jackson ~ as.factor(race) + as.factor(income) + as.factor(precinct), data = vote, family = "binomial")
+
+#Interaction models (lm10 did not converge likely due to lack of information (NA's present) from overstratification)
+lm8 <- glm(jackson ~ as.factor(race) + as.factor(income) + as.factor(race):as.factor(income), data = vote, family = "binomial")
+lm9 <- glm(jackson ~ as.factor(race) + as.factor(precinct) + as.factor(race):as.factor(precinct), data = vote, family = "binomial")
+#lm10 <- glm(jackson ~ as.factor(race) + as.factor(income) + as.factor(precinct) + as.factor(precinct)*as.factor(income), data = vote, family = "binomial")
+
+summary(int_model)
+summary(lm1)
+summary(lm2)
+summary(lm3)
+summary(lm4)
+summary(lm5)
+summary(lm6)
+summary(lm7)
+summary(lm8)
+summary(lm9)
+#summary(lm10)
+
+#Model comparisons/selections
+anova(lm4, lm8, test = "Chisq") #necessity of int b/t race and income
+anova(lm5, lm9, test = "Chisq") #necessity of int b/t race and precinct
+
+exp(3.29) #increase in log odds for black voters (race only model)
+```
+
+I first fit univariate and multivariate models with and without interactions to quantitatively explore voting behavior relationships. Results show that non-White races (besides Asians) have a greater odds of voting for Jackson, with the odds increasing by $e^{3.29}=26.84$ times alone amongst Black voters! This corresponds to a $(\frac{p}{1-p})=26.84 \longrightarrow p\approx 0.9640 = 96.4\%$ chance of voting for Jackson amongst Black voters. Certain precincts have anywhere from about 7 to 190% higher odds of voting for Jackson. Income groups also show significance, but much of this disappears in the presence of other variables. Few significant interactions are detected.
+
+Four unique models based on previously significant characteristics are chosen by stepwise iterations, Mallows’ Cp criteria, adjusted $R^2$ criteria, and binomial LASSO regression. The binomial LASSO regression model considered interactions between race and precinct, which held a few significant terms from previous multivariate fits, but these interactions were not considered in the other models due to collinearity considerations. The models chosen by Mallows’ Cp and adjusted $R^2$ criteria are ones exhibiting lowest Cp or highest adjusted $R^2$ value, respectively, within an exhaustive search for the top models of each size of up to 20 variables. Removing high leverage points during the search influences model selection for Mallows’ Cp more than for adjusted $R^2$, narrowing down the former model size from 14 to 12 variables and barely altering the latter's top choice (Figures 5-8). 
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Create new variables setting levels not individually significant to zero
+sig_race <- c(2,3,5)
+sig_income <- c(3:8)
+sig_precincts <- c(11,15,22,24,31,53,55,61,62,63,64,65,72,73,74,81,84,85,91,92,94,95)
+
+vote$racesig <- (as.numeric(vote$race) %in% sig_race) * vote$race
+vote$incomesig <- (as.numeric(vote$income) %in% sig_income) * vote$income
+vote$precinctsig <- (as.numeric(vote$precinct) %in% sig_precincts) * vote$precinct
+```
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+##MODEL 1: STEPWISE 
+
+#Create design matrix for stepwise
+mod_data <- vote[,5:8] #subset
+mod_data$racesig <- as.factor(mod_data$racesig)
+mod_data$incomesig <- as.factor(mod_data$incomesig)
+mod_data$precinctsig <- as.factor(mod_data$precinctsig)
+form <- jackson ~ racesig*precinctsig + incomesig
+mod_matrix <- as.data.frame(model.matrix(form, data = mod_data))[-1] #create model matrix as data frame (dummies for each factor level, and interaction)
+mod_matrix$jackson <- mod_data$jackson #append jackson
+
+#Forward selection
+minmod1 <- glm(jackson ~ 1, data = mod_matrix, family = "binomial")
+maxmod1 <- glm(jackson ~ ., data = mod_matrix, family = "binomial")
+
+fwd.step <- step(minmod1, direction = "forward", scope = formula(maxmod1), k = 2, trace = 0) #forward selection using AIC criterion
+fwd_coeffs <- names(fwd.step$coefficients)[-1] #variables kept
+fwd_formula <- formula(fwd.step) #formula
+length(fwd_coeffs)
+
+#Both directions stepwise
+both.step <- step(minmod1, direction = "both", scope = formula(maxmod1), k = 2, trace = 0) #both ways selection using AIC criterion
+both_coeffs <- names(both.step$coefficients)[-1] #variables kept
+both_formula <- formula(both.step) #formula
+length(both_coeffs)
+```
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE, fig.show = 'hide'}
+##MODEL 2: CP ON EXHAUSTIVE SEARCH
+
+#Create design matrix without interactions
+form <- jackson ~ racesig + precinctsig + incomesig
+cp_mod_matrix <- as.data.frame(model.matrix(form, data = mod_data))[-1] #delete intercept col
+cp_mod_matrix$jackson <- mod_data$jackson #append jackson
+dim(cp_mod_matrix)
+
+jackson_index <- which(colnames(cp_mod_matrix) == "jackson")
+
+#Top model per model size
+cp_topmod <- regsubsets(x = cp_mod_matrix[,-ncol(cp_mod_matrix)], y = cp_mod_matrix$jackson, nbest = 1, nvmax = 20)
+
+#Cp plot before removing high lev pts
+plot(1:20, summary(cp_topmod)$cp, xlab = "# Parameters", ylab = "Cp")
+```
+
+\newpage
+```{r, echo = FALSE, fig.width = 6, fig.height = 4.5, fig.align = 'center'}
+#Narrowed in Cp plot
+plot(1:20, summary(cp_topmod)$cp, xlab = "Model Size", ylab = expression(C[p]), ylim=c(min(summary(cp_topmod)$cp), median(summary(cp_topmod)$cp)), main = "Mallows' Cp (Before Removing Leverage)")
+```
+
+\begin{center} 
+\footnotesize Figure 5. Model size chosen by Mallows' Cp criterion before removing high leverage points.
+\end{center}
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE, fig.show = 'hide'}
+#Regressors present in 14 variable model
+cp_topvars <- summary(cp_topmod)$which[14,][-1] #which variables are in/not in model
+cp_varnames <- names(which(cp_topvars == T)) #names of regressors
+
+
+##Find and remove high leverage points from model
+
+cp_fit <- glm(jackson ~ ., cp_mod_matrix, family = "binomial")
+
+#Identify high leverage points (large hat values)
+hats <- lm.influence(cp_fit)$hat
+names(hats) <- rownames(cp_mod_matrix)
+hat_cutoff <- 3*mean(hats)
+
+high_lev_pts <- which(hats > hat_cutoff) #indexes of high leverage points
+
+#Remove high leverage points
+cp_mod_matrix <- cp_mod_matrix[-high_lev_pts, ]
+
+
+##Redo Cp fit and evaluation
+
+#Top model per model size
+cp_topmod <- regsubsets(x = cp_mod_matrix[,-ncol(cp_mod_matrix)], y = cp_mod_matrix$jackson, nbest = 1, nvmax = 20)
+
+#Cp plot after removing lev pts
+plot(1:20, summary(cp_topmod)$cp, xlab = "# Parameters", ylab = "Cp")
+```
+
+```{r, echo = FALSE, fig.width = 6, fig.height = 4.5, fig.align = 'center'}
+#Narrowed in Cp plot
+plot(1:20, summary(cp_topmod)$cp, xlab = "Model Size", ylab = expression(C[p]), ylim=c(min(summary(cp_topmod)$cp), median(summary(cp_topmod)$cp)), main = "Mallows' Cp (After Removing Leverage)")
+```
+
+\begin{center} 
+\footnotesize Figure 6. Model size chosen by Mallows' Cp criterion after removing high leverage points. Leverage points change model selection here.
+\end{center}
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Regressors present in 12 variable model
+cp_topvars <- summary(cp_topmod)$which[12,][-1] #which variables are in/not in model
+cp_varnames <- names(which(cp_topvars == T)) #names of regressors
+```
+
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+##MODEL 3: ADJUSTED R2 ON EXHAUSTIVE SEARCH 
+
+r2_mod_matrix <- cp_mod_matrix #make a copy of non-interaction dataset
+
+#Top model of size up to 20 variables
+r2_mods <- regsubsets(jackson ~ ., data = r2_mod_matrix, nbest = 1, nvmax = 20, method = "exhaustive")
+```
+
+```{r, echo = FALSE, fig.width = 6, fig.height = 4.5, fig.align = 'center'}
+#adjR2 plot
+plot(r2_mods, scale = "adjr2", main = "Adjusted R^2 for Top Models (Before Removing Leverage)", ylab = "Adjusted R2")
+```
+
+\begin{center} 
+\footnotesize Figure 7. Models chosen by adjusted $R^2$ criterion before removing high leverage points.
+\end{center}
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Top model
+r2_indexes <- rank(summary(r2_mods)$adjr2) #indexes of ordered adjusted R2, lowest -> highest
+r2_best <- summary(r2_mods)$which[r2_indexes,] #reorder models based on adjusted R2
+r2_topmod <- r2_best[nrow(r2_best),-1] #take top model (lower rankings -> higher adjR2 values), remove int
+
+r2_modvars <- names(r2_topmod[which(r2_topmod == TRUE)]) #adjR2-selected variables
+length(r2_modvars) #model size
+
+
+#Assess high leverage points:
+r2_fit <- glm(jackson ~ ., r2_mod_matrix, family = "binomial")
+
+r2_hats <- lm.influence(r2_fit)$hat
+names(r2_hats) <- rownames(r2_mod_matrix)
+#sort(hats, decreasing = T)
+r2_hat_cutoff <- 3*mean(r2_hats)
+
+r2_high_lev_pts <- which(r2_hats > r2_hat_cutoff) #indexes of high leverage points
+
+r2_mod_matrix <- r2_mod_matrix[-r2_high_lev_pts, ]
+
+
+#Redo adj-R^2 fit:
+
+#Top model of size up to 20 variables
+r2_mods <- regsubsets(jackson ~ ., data = r2_mod_matrix, nbest = 1, nvmax = 20, method = "exhaustive")
+```
+
+```{r, echo = FALSE, fig.width = 6, fig.height = 4.5, fig.align = 'center'}
+#adjR2 plot
+plot(r2_mods, scale = "adjr2", main = "Adjusted R^2 for Top Models (After Removing Leverage)", ylab = "Adjusted R^2")
+```
+
+\begin{center} 
+\footnotesize Figure 8. Models chosen by adjusted $R^2$ criterion after removing high leverage points. Leverage points barely change final model selection in this case.
+\end{center}
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Top model
+r2_indexes <- rank(summary(r2_mods)$adjr2) #indexes of ordered adjusted R2, lowest -> highest
+r2_best <- summary(r2_mods)$which[r2_indexes,] #reorder models based on adjusted R2
+r2_topmod <- r2_best[nrow(r2_best),-1] #take top model (lower rankings -> higher adjR2 values), remove int
+
+r2_modvars <- names(r2_topmod[which(r2_topmod == TRUE)]) #adjR2-selected variables
+length(r2_modvars) #model size
+```
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE, fig.show = 'hide'}
+##MODEL 4: BINOMIAL LASSO
+
+#Lasso & Cross-Validation
+lasso_matrix <- as.matrix(mod_matrix)
+lasso_reg <- glmnet(x = lasso_matrix[,1:(ncol(lasso_matrix)-1)], y = lasso_matrix[,ncol(lasso_matrix)], family = "binomial", standardize = F)
+lasso_cv <- cv.glmnet(x = lasso_matrix[,1:(ncol(lasso_matrix)-1)], y = lasso_matrix[,ncol(lasso_matrix)], family = "binomial", nfolds = 5, type.measure = "auc", keep = TRUE)
+
+#Lambda minimizing MSE
+plot(lasso_cv)
+
+#Shrinkage plot of coefficients
+plot(lasso_reg, xvar = "lambda")
+abline(v = log(lasso_cv$lambda.min), lty = 2)
+
+#Optimal lambda value, and corresponding CV MSE
+min_lambda <- lasso_cv$lambda.min
+min_lambda
+lasso_cv$cvm[which(lasso_cv$lambda == min_lambda)]
+
+#Subset nonzero coefficients
+opt_lambda_coeffs <- data.frame(as.matrix(coef(lasso_cv, s = "lambda.min"))) #coefficient values
+nonzero_coefs <- case.names(opt_lambda_coeffs)[which(!(opt_lambda_coeffs$X1 == 0))] #coeff names
+nonzero_coefs <- nonzero_coefs[-1] #remove intercept name
+length(nonzero_coefs) #number of nonzero remaining coeffs
+```
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+##ASSESS FIT
+
+#Stepwise models
+step_finalfit <- glm(fwd_formula, mod_matrix, family = "binomial")
+step_summ <- summary(step_finalfit)
+step_adjR2 <- 1 - (step_summ$deviance/step_summ$null.deviance)
+
+#Cp
+cp_finalfit <- glm(jackson ~ ., mod_matrix[,c(cp_varnames, "jackson")], family = "binomial")
+cp_summ <- summary(cp_finalfit)
+cp_adjR2 <- 1 - (cp_summ$deviance/cp_summ$null.deviance)
+
+#adjR2
+r2_finalfit <- glm(jackson ~ ., mod_matrix[,c(r2_modvars, "jackson")], family = "binomial")
+r2_summ <- summary(r2_finalfit)
+r2_adjR2 <- 1 - (r2_summ$deviance/r2_summ$null.deviance)
+
+#Lasso model
+lasso_finalfit <- glm(jackson ~ ., mod_matrix[,c(nonzero_coefs, "jackson")], family = "binomial")
+lasso_summ <- summary(lasso_finalfit)
+lasso_adjR2 <- 1 - (lasso_summ$deviance/lasso_summ$null.deviance)
+```
+
+\newpage
+This final model selected is the one found using adjusted $R^2$ criterion on an exhaustive search of the best model of each size up to 20 variables, is the best of the four, boasting a good tradeoff between interpretability and explanatory power (Table 1). It also has a comparatively decent adjusted $R^2$ of 0.2361, meaning this model explains away about 23.61% of data variation.
+
+```{r, echo = FALSE, fig.align = 'center'}
+a <- c("Stepwise", "Cp Criteria", "Adjusted R^2 Criteria", "Binomial LASSO")
+b <- c(length(fwd_coeffs), length(cp_varnames), length(r2_modvars), length(nonzero_coefs))
+c <- round(c(step_adjR2, cp_adjR2, r2_adjR2, lasso_adjR2), 4)
+d <- round(c(step_summ$aic, cp_summ$aic, r2_summ$aic, lasso_summ$aic), 1)
+
+data.frame("Method" = a, "Size" = b, "Adjusted R2" = c, "AIC" = d)
+```
+
+\begin{center} 
+\footnotesize Table 1. Four model selection methods, model sizes, and adjusted $R^2$ and AIC values of fit to entire dataset. Stepwise and binomial LASSO models are larger and less interpretable, but explain more variance. Cp and adjusted $R^2$ methods yield smaller, more interpretable models, yet perform almost as well as the others do.
+\end{center}
+
+The final model contains 12 variables, including 3 racial groups, 9 precincts, and no interactions. Coefficient values (log odds ratios) are displayed in the table below with their respective standard errors. Odds ratios are found by exponentiating the coefficients (Table 2). 
+
+```{r, echo = FALSE, fig.align = 'center'}
+e <- c("(Intercept)", "Hispanic", "Black", "Other", "Precinct 22", "Precinct 31", "Precinct 53", "Precinct 55", "Precinct 64", "Precinct 74", "Precinct 81", "Precinct 84", "Precinct 92")
+f <- round(cp_summ$coefficients[,1], 2)
+g <- round(cp_summ$coefficients[,2], 2)
+h <- round(exp(cp_summ$coefficients[,1]), 2)
+k <- round(cp_summ$coefficients[,4], 4)
+
+final <- data.frame(row.names = e, "LogOR" = f, "SE" = g, "OR" = h, "P-value" = k)
+final[1,3] = NA
+final
+```
+\begin{center} 
+\footnotesize Table 2. Final model coefficients (log odds ratio), SE, odds ratio, and significance values. See analysis for interpretations.
+\end{center}
+
+\newpage
+##Discussion 
+
+The final model asumes no sampling biases or recording errors, that the sample contains the entire population, and that individual responses are independent. However, these assumptions are overly ideal. For example, similar-minded voters from the same family violates the independence assumption. Given these limitations, this model is not highly generalizable to non-ideal scenarios. On the other hand, it reasonable that race affects voting behavior, and disparities between precincts may manifest from cultural differences and candidate campaigning efforts, so the model retains some validity. 
+
+Interpretation-wise, the coefficients are the log odds ratios associated with being versus not being in a certain variable category, holding other variables constant. The OR for the intercept is removed because it does not make sense to evaluate the odds ratio for a unit increase in intercept. Black voters have a 31 times increased odds of voting for Jackson compared to non-Black voters, an effect far surpassing Hispanic or other race’s impacts (1.53 times and 3.42 times, respectively). Hispanic voters, controlling for precincts, do not seem to support Jackson as much as other minority voters do. Precincts effects are much milder; living in precincts 53 or 55 increases one's odds by about 2.5 times, while precinct 31 and 84 residents have a dramatically reduced odds (OR = 0.09). Figure 2 confirms this observation, where two races are missing and very few voters opted for Jackson. I hypothesize that income variables did not appear in the final model because its effect is sufficiently explained by race. Both minorities and lower income groups exhibited higher support for Jackson.
+
+Regarding other models, the forward and both-direction stepwise (which yielded the same model) and LASSO models have slightly higher adjusted $R^2$ values and lower AIC than both Cp and adjusted $R^2$ models, but their composition is also much harder to interpret. This negligible 2% increase in explanatory power is not worth the extra complexity. Mallows’ Cp and adjusted $R^2$ for `regsubsets()` exhaustive search yielded similar models with little disparity in final explanatory power or AIC and similar interpretability. Thus, the choice of the adjusted $R^2$ model is slightly arbitrary. There is little good reason to not prefer the Cp model, with one less variable and slightly only reduced explanatory power.
+
+##Summary
+
+According to data analysis on an exit poll from the 1988 Democratic presidential nominee election, non-Asian minority voters and voters from certain precincts are more likely to support the Black candidate others are. Black voters are the most supportive, while Hispanic voters are supportive to a lesser degree than other minorities are. These results come from a model built based on adjusted $R^2$ criterion and explains about 25% of variation in the data.
+
+\newpage
+##References
+
+Internet sources:
+
+* For plotting help: 
+
++ http://stackoverflow.com/questions/3932038/plot-a-legend-outside-of-the-plotting-area-in-base-graphics 
+
++ https://www.datacamp.com/community/tutorials/15-questions-about-r-plots#q3)
+
+* For help with creating a model matrix containing interactions: http://stackoverflow.com/questions/22649536/model-matrix-with-all-pairwise-interactions-between-columns)
+
+Packages used:
+
+* `DataComputing` -- for various methods: http://data-computing.org/accessing-data-computing-data-and-software/
+
+* `leaps` -- for `leaps()` and `regsubsets()` exhaustive search: https://cran.r-project.org/web/packages/leaps/leaps.pdf
+
+* `cvTools` -- for cross-validation at the end: https://cran.r-project.org/web/packages/cvTools/cvTools.pdf
+
+* `glmnet` -- for binomial LASSO regression and cross-validation: ftp://debian.ustc.edu.cn/CRAN/web/packages/glmnet/glmnet.pdf
+
+* `RColorBrewer` -- for logistic scatterplot colors: https://cran.r-project.org/web/packages/RColorBrewer/RColorBrewer.pdf
+
+Lecture slides (from Professor Deborah Nolan) consulted:
+
+* LogisticRegression.html – for the mosaic plot and jittered scatterplot ideas and code 
+
+* ModelSelection.html -- for the decision to zoom into Cp plots, and for `leaps()`, `regsubsets()`, and stepwise selection code
+
+Lab examples (from Omid Solari) referenced:
+
+* Lab 0412 -- for stepwise code and cautions in model interpretation
+
+* Lab 0419 -- for LASSO graph code
+
+Notes taken in class:
+
+* On the topics of collinearity, PCA, cross-validation, model selection, AIC/BIC, ridge and LASSO regression, logistic regression, and generalized linear models
+
+Note: Some of this code was taken from my own implementation of HW5 about baseball data analysis.
+
+A huge thank you to Professor Nolan and Omid Solari for helping me debug throughout the project!

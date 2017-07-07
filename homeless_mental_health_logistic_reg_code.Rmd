@@ -1,0 +1,281 @@
+---
+title: "PH241 Final Project"
+author: "Jiying Zou"
+date: "April 15, 2017"
+output: pdf_document
+---
+```{r, include = FALSE}
+library(DataComputing)
+library(ggplot2)
+library(foreign)
+
+#Read data
+df1 <- read.csv("~/Documents/ph241/victimization.csv")
+df2 <- read.dta("~/Documents/ph241/michelle2.dta")
+names(df2)[1] <- "ID"
+df <- merge(df1, df2, by = "ID")
+
+#Feature engineer explanatory variables
+df$abuse6 <- ((df$A3e + df$A4e) > 0) - 0 #physical and sexual abuse in last 6 months
+
+#Remove rows that are missing E or D values
+df <- df[(is.na(df$depressivesx) + is.na(df$abuse6) == 0),]
+```
+
+
+```{r}
+#Explore imbalances in the data
+mosaicplot(table(df$abuse6, df$depressivesx), main = "", ylab = "Mental Health Issues", xlab = "Abuse in Past 6 Months")
+print(paste(sum(df$abuse6), "individuals suffered abuse in the last six months, whereas", nrow(df)-sum(df$abuse6), "didn't."))
+
+mosaicplot(table(df$male, df$abuse6), main = "", ylab = "Abuse in Past 6 Months", xlab = "Gender (0 = female, 1 = male)")
+mosaicplot(table(df$male, df$depressivesx), main = "", ylab = "Mental Health Issues", xlab = "Gender (0 = female, 1 = male)")
+print(paste("There are", sum(df$male), "males in the sample as opposed to", nrow(df)-sum(df$male), "females."))
+```
+From the second mosaic plot it looks like about the same proportion of females as males suffered abuse in past 6 months, so gender might be independent from abuse in past 6 months. The third mosaic plot also hints independence, so in all it doesn't look like gender is a confounder at all!
+
+##Variable Codings
+
+Response (Y) -- `depressivesx`: dichotomous depression measurement variable
+
+Primary explanatory (X) -- `abuse6`: physical/sexual abuse in the last 6 months
+
+Age dichotomous: `bin_age` = 0 if 50-59, 1 if 60-80 y.o.
+
+Three age group codings:
+(baseline) -- 50-59 y.o.
+age1 -- 60-69 y.o.
+age2 -- 70+ y.o. (actually 70-80, since we had one 80 y.o. observation)
+
+Age scaled -- `c_age` = (age - 50)/10 
+[age = 0 means 50 y.o. now, scaled by up 1 unit = up 10 years]
+
+##Simple Model Building (Focus on Confounding)
+
+###Model 1: Simple exposure vs disease
+
+```{r}
+lm1 <- glm(depressivesx ~ abuse6, data = df, family = "binomial")
+summary(lm1)
+```
+
+###Model 2: Age as Confounder (Indicator Variables)
+
+This model allows OR's to fluctuate randomly in diff levels, no restrictions.
+Three age group codings:
+(baseline) -- 50-59 y.o.
+age1 -- 60-69 y.o.
+age2 -- 70+ y.o. (actually 70-80, since we had one 80 y.o. observation)
+
+```{r}
+#Age range
+print(paste("The range of ages are", min(range(df$Age)), "to", max(range(df$Age))))
+
+#Encode 3 age groups: 50-59 (baseline), 60-69, 70-80
+df$age1 <- df$Age %in% c(60:69)
+df$age2 <- df$Age >= 70
+
+lm2 <- glm(depressivesx ~ abuse6 + age1 + age2, data = df, family = "binomial")
+summary(lm2)
+```
+
+There is very significant confounding by age, using the model that allows OR to vary by three age groups! However there's probably a lack of information for the third age group since it only contains observations where age is 80. Ignore that coefficient.
+
+###Model 3: Dichotomous Age (Threshold Model)
+
+Does age, appearing as a dichotomized variable (0 for 50-59, 1 for 60-80 y.o.) confound the relationship?
+Can we get away with this threshold model?
+
+```{r}
+#Encoding binary age variable: 0 for 50-59, 1 for 60-80
+df$bin_age <- (df$Age >= 60)
+
+#Model
+lm3 <- glm(depressivesx ~ abuse6 + bin_age, data = df, family = "binomial")
+summary(lm3)
+
+#Log likelihood test between nested models (test for threshold effect)
+crit_val <- as.numeric(2*(logLik(lm2)-logLik(lm3)))
+pchisq(crit_val, 1, lower.tail = FALSE)
+```
+
+Insignificant p-value --> looks like we can! The threshold model is a sufficient fit.
+
+###Model 4: Various Age Levels in One Variable (Dose Response)
+
+Do we need a dose response model? (Recenter age to be baseline 50 and 10 year increases, variable known as `c_age`)
+
+```{r}
+#Recenter age, 1 unit increase now means 10 year old increase
+df$c_age <- floor((df$Age-50)/10)
+
+#Model
+lm4 <- glm(depressivesx ~ abuse6 + c_age, data = df, family = "binomial")
+summary(lm4)
+
+#Log likelihood test comparing lm4 (dose response) to lm2 (OR's free to vary)
+crit_val <- as.numeric(2*(logLik(lm2)-logLik(lm4)))
+pchisq(crit_val, 1, lower.tail = FALSE)
+```
+
+Also an insignificant p-value... between these models we can get away with dose response. Comparing the results of the two LRT's, it loos like threshold is a simpler, better model than dose response. 
+(Logic: indicators vs threshold -- p-value ~70%; indicators vs dose response -- p-value ~15%, threshold model seems much less different from indicators than dose response is (very much larger p-value), but this is just an intuitive response, don't take p-values that seriously!!)
+
+```{r}
+logORs <- df %>% group_by(c_age) %>%
+  summarise(logOR = log((sum(depressivesx)/n())/(1-(sum(depressivesx)/n()))))
+logORs
+
+#Age Categories log(OR Plot)
+logORs %>% ggplot(aes(x = as.character(c_age), y = logOR)) + geom_point(size = 3) + labs(title = "Age Group vs Risk of Mental Illness", x = "Age Category", y = "Log Odds") + scale_x_discrete(labels = c("0" = "50-59","1" = "60-69", "2" = "70-79", "3" = "80+"))
+```
+
+**NOTE:** The 80+ age category has a very inaccurate log(OR) estimate because there is only ONE OBSERVATION.
+This graph was generated using `c_age`, not `age1` and `age2`, which is why there's an 80+ category (verbally mention to ignore this last dot, or somehow cut it out of the graph if we use it!!!)
+
+###Model 5: Gender as Confounder
+
+```{r}
+lm5 <- glm(depressivesx ~ abuse6 + male, data = df, family = "binomial")
+summary(lm5)
+```
+
+Also little evidence of confounding by gender.
+
+###Model 6: Age and Gender Interaction
+
+```{r}
+lm6 <- glm(depressivesx ~ abuse6 + Age + male + Age*male, data = df, family = "binomial")
+summary(lm6)
+```
+
+No strong evidence of interaction between age and gender.
+
+###Model 7: Time Homeless as Confounder
+
+```{r}
+lm7 <- glm(depressivesx ~ abuse6 + homeless1year, data = df, family = "binomial")
+summary(lm7)
+```
+
+Not much confounding by time homeless.
+
+##Model 8: Drug Use (Dichotomous)
+
+```{r}
+lm8 <- glm(depressivesx ~ abuse6 + risky_3drugs, data = df, family = "binomial")
+summary(lm8)
+```
+
+Drug abuse seems to be our second confounder!
+
+```{r}
+logORs <- df %>% group_by(risky_3drugs) %>%
+  summarise(logOR = log((sum(depressivesx)/n())/(1-(sum(depressivesx)/n()))))
+logORs
+
+logORs %>% ggplot(aes(x = as.factor(risky_3drugs), y = logOR)) + geom_point(size = 3) + labs(title = "Drug Abuse vs Risk of Mental Health Illness", x = "Drug Abuse", y = "Log Odds") + scale_x_discrete(labels = c("0" = "No", "1" = "Yes"))
+```
+
+##Model 9: Interaction Between Drug Abuse and Length of Time Homeless
+
+Is interaction needed? Are models significantly different without the interaction term?
+
+```{r}
+lm9 <- glm(depressivesx ~ abuse6 + risky_3drugs*homeless1year, data = df, family = "binomial")
+summary(lm9)
+```
+
+Barely any evidence of interaction between length of time homeless and drug abuse (Wald test p-value 44%).
+
+```{r}
+logORs <- df %>% group_by(risky_3drugs, homeless1year) %>%
+  summarise(logOR = log((sum(depressivesx)/n())/(1-(sum(depressivesx)/n()))))
+logORs <- logORs[-which(is.na(logORs$homeless1year)), ]
+
+logORs$homeless1year <- replace(logORs$homeless1year, which(logORs$homeless1year == 0), "Homeless < 1 year")
+logORs$homeless1year <- replace(logORs$homeless1year, which(logORs$homeless1year == 1), "Homeless > 1 year")
+
+logORs %>% ggplot(aes(x = as.factor(risky_3drugs), y = logOR),) + 
+  geom_point(size = 3) + 
+  facet_wrap(~homeless1year) + 
+  labs(title = "Interaction between Drug Abuse and Time Homeless", x = "Drug Abuse", y = "Log Odds") + 
+  scale_x_discrete(labels = c("0" = "No", "1" = "Yes"))
+```
+
+Similar slopes (effects) -- no effect modification/interaction!
+
+##Model 10: Confounding by Social Support
+
+Availability of social support: `p1c` variable -- 1 means yes, 2 means no -- recode 2's to 0's
+
+```{r}
+#Recode
+df$p1c <- replace(df$p1c, which(df$p1c == 2), 0)
+
+lm10 <- glm(depressivesx ~ abuse6 + p1c, data = df, family = "binomial")
+summary(lm10)
+```
+```{r}
+logORs <- df %>% group_by(p1c) %>%
+  summarise(logOR = log((sum(depressivesx)/n())/(1-(sum(depressivesx)/n()))))
+logORs <- logORs[-which(is.na(logORs$p1c)), ]
+
+logORs %>% ggplot(aes(x = as.factor(p1c), y = logOR)) + geom_point(size = 3) + labs(title = "Social Support vs Risk of Mental Health Illness", x = "Social Support", y = "Log Odds") + scale_x_discrete(labels = c("0" = "Absence", "1" = "Presence"))
+```
+Slight confounding with presence of social support!
+
+##Final Model
+
+Final variables: Dichotomous age, drug abuse, time homeless (very very weakly), interaction between drug abuse and time homeless, social support
+
+```{r}
+final_mod1 <- glm(depressivesx ~ abuse6 + bin_age + risky_3drugs + homeless1year + p1c, data = df, family = "binomial")
+summary(final_mod1)
+```
+
+I included `homeless1year` but it had an iffy significance... can we remove it?
+
+```{r}
+final_mod2 <- glm(depressivesx ~ abuse6 + bin_age + risky_3drugs + p1c, data = df, family = "binomial")
+summary(final_mod2)
+
+#Log likelihood test comparing final models with and without homeless1year
+crit_val <- as.numeric(2*(logLik(final_mod1)-logLik(final_mod2)))
+pchisq(crit_val, 1, lower.tail = FALSE)
+```
+
+**Final model discussion:**
+These two models are significantly different (p-value 0.03 --> ~3%), so we would want to keep `homeless1year` in our model, even though it wasn't significant in `final_mod1`. From a public health point of view, we would benefit to be less tight on these p-values, because if we did leave out considering time homeless in prevention or treatment programs, we would cut out a good group of people that we would've helped otherwise. We can interpret `homeless1year` using a 0.2 p-value (rather than the stringent 0.05) to work our way around this, so that in the end we take into consideration time homeless when implementing strategies to help, but just weight it a little more lightly than the other three variables, binary age, drug abuse, and degree of social support!
+
+Thus I've found our final model is:
+
+$$log(\frac{p}{1-p})=0.6096+0.7202*abuse6-1.0195*bin\_age+0.7186*risky\_3drugs-0.3176*homeless1year-0.6476*p1c)$$
+
+##Log likelihoods
+
+Here is a list of log likelihoods for each model:
+```{r}
+loglikelihoods <- c(logLik(lm1), logLik(lm2), logLik(lm3), logLik(lm4), logLik(lm5), logLik(lm6), logLik(lm7), logLik(lm8), logLik(lm9), logLik(lm10))
+
+
+for(i in 1:length(loglikelihoods)){
+  print(paste("Model", i, "has log likelihood", loglikelihoods[i]))
+}
+
+print(paste("Final model 1 has log likelihood", logLik(final_mod1)))
+print(paste("Final model 2 has log likelihood", logLik(final_mod2)))
+```
+
+##FINAL DECISION
+
+**We will go with Final Model 1**
+
+##Failed attempt at GOF test
+
+final_vectors <- c("abuse6", "bin_age", "risky_3drugs", "homeless1year", "p1c")
+finalmatrix <- df[ ,final_vectors]
+NAs <- c(which(is.na(finalmatrix$homeless1year)), which(is.na(finalmatrix$p1c)))
+finalmatrix <- as.matrix(finalmatrix[-NAs,])
+
+chisq.test(finalmatrix, df$depressivesx, rescale.p = T) #THIS AINT WORKINNNN

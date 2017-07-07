@@ -1,0 +1,324 @@
+---
+title: "Stat151A HW5"
+author: "Jiying Zou"
+date: "April 8, 2017"
+output: html_document
+---
+##Introduction
+
+In this project we will try to model and predict baseball players' salaries from a variety of related factors. The dataset we will be using contains information on many baseball players and their performance during 2012 as well as throughout their career. Some of these factors include performance stats such as number of hits, home runs, number of times at-bat etc., and others include number of years in the major leagues and player position. We will explore anomalies in the data and some appropriate transformations, as well as consider interactions between variables. In the end, we will use Mallows' Cp and BIC to produce a predictive model for our data.
+
+```{r}
+library(corrplot)
+library(car)
+library(leaps)
+#Load in dataset titled 'baseball'
+load("~/Documents/stat151/HW/hw5/baseball2012.rda")
+```
+
+##Data Exploration/Feature Engineering
+
+First, we want to prepare the data for better analysis by feature engineering on some of the variables. We will create new variables from existing variables that mirror the variables Fox creates in his analysis of a similar dataset (from section 22.1.2 of Fox's book *Applied Regression Analysis and Generalized Linear Models*).
+
+```{r}
+#Feature engineer new variables
+
+#2012 and career batting averages (hits/at-bats)
+baseball$AVG <- baseball$H / baseball$AB
+baseball$'Career AVG' <- baseball$CH / baseball$CAB
+
+#2012 and career on base percentages (100 x [hits + walks]/[at-bats + walks])
+baseball$OBP <- 100 * ((baseball$H + baseball$BB) / (baseball$AB + baseball$BB))
+baseball$'Career OBP' <- 100 * ((baseball$CH + baseball$CBB) / (baseball$CAB + baseball$CBB))
+
+#Per-year statistics
+baseball$'AB/year' <- baseball$CAB / baseball$years #At-bats per year
+baseball$'H/year' <- baseball$CH / baseball$years #Hits per year
+baseball$'HR/year' <- baseball$CHR / baseball$years #Home runs per year
+baseball$'R/year' <- baseball$CR / baseball$years #Runs scored per year
+baseball$'RBI/year' <- baseball$CRBI / baseball$years #Runs batted in per year
+
+#Three player position dummy variables (middle infielders, catcher, center field)
+baseball$MI <- (baseball$POS %in% c("2B", "SS")) - 0 #second base or shortstop
+baseball$C <- (baseball$POS == "C") - 0
+baseball$CF <-(baseball$POS == "CF") - 0
+
+#Two dummy variables for years of major league experience (1 for 3-5 yrs, 1 for 6+ years)
+baseball$'Arbitration eligible' <- (baseball$years %in% c(3:5)) - 0
+baseball$'Free-agency eligible' <- (baseball$years >= 6) - 0
+```
+
+Since we are trying to predict player salary, we wouldn't want to consider cases without information about salary, so we remove these rows.
+
+```{r}
+#Remove rows without salary data
+baseball <- baseball[is.na(baseball$salary) == F,]
+```
+
+####Correlation Plot
+
+First, to assess patterns of correlation, we can look at the correlation plot. Darker, skinnier blue ellipses indicate stronger, linear relationships. From this plot we can tell that:
+
+* The variable `years` is strongly correlated with the career-related variables, and less correlated with 2012-specific variables
+
+* Some variables, like the number of strikeouts in 2012 (`SO`), are positively correlated with 2012-related variables but weakly associated with overall career-related variables.
+
+* The only slight negative association in this plot occurs between `years` and `E` or `SO`, which may be reasonable because as a player becomes more experienced, we'd expect less errors and strikeouts. However, this association is so slight that the scatterplot matrix is preferrable for examination.
+
+```{r}
+corrplot(cor(baseball[c("salary", "AB", "CAB", "RBI", "CRBI", "R", "CR", "H", "CH", "HR", "CHR", "BB", "CBB", "E", "SO", "years")]), method = "ellipse")
+```
+
+
+####Scatterplot Matrices 
+
+Next, let's use some scatterplot matrices to get more visual details about relationships between the response variable, `salary`, and judiciously selected explanatory variables. I have separately plotted the relationships between salary and previously feature engineered variables, since by design we expect some degree of collinearity from them with existing variables.
+
+```{r, fig.width= 8, fig.height= 8}
+#Scatterplot matrix 1
+scatterplotMatrix(baseball[c("salary", "AB", "CAB", "RBI", "CRBI", "R", "CR", "H", "CH", "years")])
+
+#Scatterplot matrix 2
+scatterplotMatrix(baseball[c("salary", "H", "HR", "CHR", "BB", "CBB", "E", "SO", "years")])
+
+#Scatterplot matrix for created variables
+scatterplotMatrix(baseball[c("salary", "Career AVG", "AB/year", "H/year", "HR/year", "R/year", "RBI/year")])
+```
+
+Confirming our previous speculation about `years` vs. `E` or `SO`, the corresponding plotted pairs show non-linear blobs of data points. In fact, `years` seems to have a curvilinear relationship with many other variables, indicating some need for a transformation on `years`. We will address this in a moment.
+
+We also make the following observations from the first two pairs plots:
+
+* Nonlinearity: Salary seems to be non-linearly correlated with many variables such as career at bats (`CAB`), career runs batted in (`CRBI`), career runs (`CR`), career hits (`CH`), career home runs (`CHR`), career walks (`CBB`), and years in major leagues (`years`). These plots show a somewhat "L"-shaped relationship, more obviously seen in `salary` vs. `E` or `salary` vs. `years`. Similar to `years`, this suggests that there may be two groups of observations inducing these curvilinear relationships -- one group where as their player stats increase, their salary increases, and another where no matter how their stats increase, their salary seems to stay the same! We may want to log transform `salary` to create a more linear relationship.
+
+* Collinearity: Several of the career statistics (career home runs, career at-bats, career hits, etc.) are extremely collinear -- as one career stat increases, others tend to follow. For example, career hits (`CH`) and career runs (`CR`) are strongly positively correlated, as is career at-bats (`CAB`) with career runs batted in (`CRBI`).
+
+* Correlations: Performance stats in 2012 are generally not as strongly correlated with career performance stats as I had thought! In fact, many of the 2012 vs. career stats plots (e.g. between `RBI` and `CRBI`) show almost vertical relationships, indicating near-independence of the two variables; there is a strong degree of randomness to perfomance in 2012 as compared to overall career stats.
+
+* Influential points: There do seem to be some outliers or leverage points, but the density of points may cover up the details. However, there are two leverage points that consistently stick out from the rest of the data, best seen in number of errors's (`E`) relationship with number of hits (`H`). We will further examine this soon.
+
+From the third correlation matrix (between salary and constructed variables), we further observe:
+
+* Nonlinearity: Again, we see a curvilinear (seemingly exponential or log-like) relationship between `salary` and the created explanatory variables, encouraging yet again a log transformation of our y, `salary`.
+
+* Correlations/collinearity: The number of at-bats per year (`AB/year`) vs. number of hits per year (`H/year`) shows the strongest positive, linear correlation in the pairs plot, though relationships of this type are seen all throughout this pairs plot. Collinearity between explanatory variables seems to be a significant problem in our modeling process!
+
+* Influential points: There are indeed some influential points present, as seen in the left tail of `Career AVG`'s relationship with `AB/year`. These points skew the perception of `Career AVG`'s relationship with all other variables, and are far from the center of the "x"'s -- thus likely have high leverage.
+
+
+####Variable Transformations
+
+The number of years a player has been in the major leagues (`years`) seems to consistently have a curvilinear relationship with other variables. Let's examine one of these relationships where the problem is most apparent, `years` vs. `SO`, to see if we can find an appropriate transformation. 
+```{r, fig.width = 5, fig.height = 3}
+#Create model
+expmod1 <- lm(SO ~ years, data = baseball)
+exp_sturesid1 <- rstudent(expmod1) #studentized residuals
+
+plot(baseball$SO ~ baseball$years, main = "Years vs. Strikeouts", xlab = "Years in Major Leagues", ylab = "Number of Strikeouts")
+points(baseball[which(abs(exp_sturesid1) > 2), c("years", "SO")], col = "red", pch = 15) #red points -- outliers
+points(baseball[which(hatvalues(expmod1) > 2*(2/nrow(baseball))), c("years", "SO")], col = "green", pch = 14) #green points -- leverage points
+
+#Studentized residuals plot for relationship between H and BB, pre-transformation
+plot(exp_sturesid1 ~ expmod1$fitted.values, main = "Residuals Plot (pre-transformation)", xlab = "Fitted Values", ylab = "Studentized Residuals")
+abline(h = 0, col = "red")
+abline(h = 2, lty = 2)
+
+#Residuals plot after years log transformation
+expmod2 <- lm(SO ~ log(years), data = baseball)
+exp_sturesid2 <- rstudent(expmod2)
+plot(exp_sturesid2 ~ expmod2$fitted.values, main = "Residuals Plot (post-transformation)", xlab = "Fitted Values", ylab = "Studentized Residuals")
+abline(h = 0, col = "red")
+abline(h = 2, lty = 2)
+
+#Assess normality of resulting residuals
+norms <- rnorm(length(expmod2$residuals), 0, 1)
+qqplot(norms, exp_sturesid2, main = "QQ Plot of Residuals Post-Transformation", xlab = "Theoretical Normal Quantiles", ylab = "Ordered Residual Quantiles")
+qqline(norms)
+```
+
+It turns out that what I thought was two groupings was indeed a bunch of leverage points (green) and outliers (red)! From the residuals plot we see that a more severe problem is non-constant variance. Taking the log transformation of `years` helped stabilize the variance, justifying our choice of transformation. From the QQ Plot we can see that the resulting residuals are slightly skewed compared to a normal distribution, but for the most part do match up with the normal distribution.
+
+The variables `H`, `AB`, and `SO` also seem problematic -- they seem to show consistent funneling in many residuals plots, and a transformation will likely stabilize variance. I will use the relationship between `H` and `SO` to carry out analysis.
+
+```{r, fig.width = 5, fig.height = 3}
+#Studentized residuals plot for H vs SO
+expmod3 <- lm(SO ~ H, data = baseball)
+exp_sturesid3 <- rstudent(expmod3)
+plot(exp_sturesid3 ~ expmod3$fitted.values, main = "Residuals Plot (pre-transformation)", xlab = "Fitted Values", ylab = "Studentized Residuals")
+abline(h = 0, col = "red")
+abline(h = c(2, -2), lty = 2)
+
+#Plot after double log transformation
+expmod4 <- lm(log(SO+1) ~ log(H+1), data = baseball)
+exp_sturesid4 <- rstudent(expmod4)
+plot(exp_sturesid4 ~ expmod4$fitted.values, main = "Residuals Plot (post-transformation)", xlab = "Fitted Values", ylab = "Studentized Residuals")
+abline(h = 0, col = "red")
+abline(h = c(2, -2), lty = 2)
+```
+
+Although the double-log transformation clustered the data points towards higher fitted values, it does seem that logging `SO` and logging `H` are both variance-stabilizing transformations. This was the best transformation I got after fiddling with various combinations. Since `AB` has similar issues, we will also take its log in our analysis.
+
+
+####Interaction Exploration
+
+There may also be interaction between explanatory terms. For example, from the following conditional plots (coplots) we observe that a player's arbitration eligibility and free-agency eligibility affects the effect of the number of runs in 2012 on their salary.
+
+Players who are not arbitration-eligible (major leagues career length < 3 years) have salaries ranging from comparatively very low (< $1 million) to around $30 million. Players who are arbitration-eligible (career length 3-5 years), however, seem to have drastically lower salaries in comparison. Their highest salaries are only around $8 million, with the majority very much below that!
+
+In comparison to players who are free-agency eligible, however, all the players previously mentioned seem to have low salaries! Free-agency eligible players (career length 6 years or more) have a much wider range of salaries, ranging from very low to almost $30 million!
+
+Since both the arbitration-eligible and free-agency-eligible variables are related to career length (`years`), it would be wise in our further analysis to consider some sort of interaction between career length and number of runs.
+
+```{r}
+coplot(baseball$'salary' ~ baseball$'R'|as.factor(baseball$`Arbitration eligible`), xlab = "Number of Runs", ylab = "Player Salary")
+coplot(baseball$'salary' ~ baseball$'R'|as.factor(baseball$`Free-agency eligible`), xlab = "Number of Runs", ylab = "Player Salary")
+```
+
+
+####Preliminary Results
+
+Some conclusions of our preliminary data analysis are that collinearity and non-linearity, as well as non-constant variance, are all problematic in our data. We have in this section decided to log transform player salary (`salary`), number of years in major leagues (`years`), number of hits (`H`), number of at-bats (`AB`), and number of strikeouts (`SO`). We have also realized that there may be interaction between career length (`years`) and number of runs (`R`) in their effects on salary.
+
+
+
+##Data Analysis
+
+####Simple Models and Unusual Data
+
+
+First, as instructed, let's fit a simple model predicting logged `salary` from the two length-of-career dummy variables we created, logged career runs, and the interaction between career length and career runs.
+
+There seem to be a lot of outliers, leverage points, and influential points! From the combined plot involving residuals, hat values, and Cook's distance (circle size) we can tell that there is one data point that is not an outlier but is a major leverage and influential point. It is characterized by a large bubble and large hat value.
+
+```{r}
+#Fit simple model
+lm1 <- lm(log(salary) ~ `Arbitration eligible` + `Free-agency eligible` + log(CR + 1) + `Arbitration eligible`*log(CR + 1) + `Free-agency eligible`*log(CR + 1), data = baseball)
+
+#Check for outliers -- studentized residuals plot
+stu_resids <- rstudent(lm1)
+plot(stu_resids ~ lm1$fitted.values, main = "Residuals Plot (Outliers)", xlab = "Fitted Values", ylab = "Studentized Residuals")
+#points(lm1$fitted.values[which(abs(stu_resids) > 2)], col = "red", pch = 15)
+abline(h = 0)
+abline(h = c(2, -2), lty = 2, col = "red")
+
+#Check for leverage points -- plot hat values
+hats <- hatvalues(lm1)
+dof <- nrow(baseball) - lm1$df.residual
+hbar <- dof/nrow(baseball)
+plot(hats, main = "Hat Values (Leverage)", ylab = "Hat Values")
+abline(h = c(2*hbar, 3*hbar), lty = 2, col = "green")
+
+#Check for influential points -- plot Cook's distance
+cooks <- cooks.distance(lm1)
+plot(cooks, main = "Cook's Distance (Influence)", ylab = "Cook's Distance")
+abline(h = 4/lm1$df.residual, lty = 2, col = "blue")
+
+#Combined plot
+plot(stu_resids ~ hats, pch = ".", main = "Outliers, Leverage, Influence", xlab = "Hat Value", ylab = "Studentized Residuals")
+abline(v = c(2*hbar, 3*hbar), lty = 2, col = "green")
+abline(h = c(2,-2), lty = 2, col = "red")
+abline(h = 0)
+symbols(x = hats, y = stu_resids, circles = sqrt(cooks)/25, inches = F, add = T)
+```
+
+Purely out of curiosity, I discovered that a good amount of outliers and influential points are players with Hispanic last names, while almost none of the leverage point players are... for the purposes of this class, I will just leave this little discovery here.
+
+```{r}
+#Outlier players
+baseball$nameLast[which(abs(stu_resids) > 2)]
+#Leverage players
+baseball$nameLast[which(hats > 2*hbar)]
+#Influential players
+baseball$nameLast[which(cooks > 4/lm1$df.residual)]
+```
+
+Next, we will fit a more complicated linear least-squares regression, incorporating transformations I came up with in our exploratory data analysis. This 35-variable model (including two interaction terms) explains away 81.08% of variation in the data (adjusted $R^2$). The interaction variable `Int1` is very insignificant, so we will remove it in our further analysis.
+
+```{r}
+#Add in interaction terms as variables
+baseball$Int1 <- baseball$`Arbitration eligible` * baseball$R
+baseball$Int2 <- baseball$`Free-agency eligible` * baseball$R
+
+#Linear least-squares model
+lm2 <- lm(log(salary) ~ PO + A + E + log(AB) + R + log(H+1) + HR + RBI + BB + log(SO+1) + IBB + HBP + log(years) + CAB + CH + CHR + CR + CRBI + CBB + MI + C + CF + AVG + `Career AVG` + OBP + `Career OBP` + `AB/year` + `H/year` + `HR/year` + `R/year` + `RBI/year` + `Arbitration eligible` + `Free-agency eligible` + `Int1` + `Int2`, data = baseball)
+
+summary(lm2)
+```
+
+
+####Assessing Collinearity
+
+We can assess collinearity in this model by taking a look at the condition index =  $\sqrt{\lambda_1/\lambda_j} \hspace{0.25cm}\forall j\in[1,p]$ for each variable, derived using PCA.
+
+```{r}
+#Transform years
+baseball$logyears <- log(baseball$years)
+
+#PCA
+p_comp <- prcomp(scale(baseball[,c('PO', 'A', 'E', 'AB', 'R', 'H', 'HR', 'RBI', 'BB', 'SO', 'IBB', 'HBP', 'logyears', 'CAB', 'CH', 'CHR', 'CR', 'CRBI', 'CBB', 'MI', 'C', 'CF', 'AVG', 'Career AVG', 'OBP', 'Career OBP', 'AB/year', 'H/year', 'HR/year', 'R/year', 'RBI/year', 'Arbitration eligible','Free-agency eligible', 'Int2')]))
+summary(p_comp)
+#Condition index
+cond_ind <- p_comp$sdev[1]/p_comp$sdev
+cond_ind
+print(paste("Condition indexes > 10 indicate significant collinearity problems and an instable regression coefficients. In our variables, there are", sum(cond_ind > 10), "cases of bad collinearity."))
+```
+
+
+####Model Selection
+
+To formally start the model selection process, I first use `leaps()` to identify the top 10 models of each size. I can then plot the Mallows' Cp value for various models of each size, and narrow in on the "bend" in the graph to see which model size yields the lowest Cp values. Models with 14-15 variables have the lowest Cp's!
+
+```{r}
+#Top 10 models per model size
+top10_persize <- leaps(x = baseball[,c('PO', 'A', 'E', 'AB', 'R', 'H', 'HR', 'RBI', 'BB', 'SO', 'IBB', 'HBP', 'logyears', 'CAB', 'CH', 'CHR', 'CR', 'CRBI', 'CBB', 'MI', 'C', 'CF', 'AVG', 'Career AVG', 'OBP', 'Career OBP', 'AB/year', 'H/year', 'HR/year', 'R/year', 'RBI/year', 'Arbitration eligible','Free-agency eligible', 'Int2')], y = baseball$salary, int = FALSE, strictly.compatible = FALSE)
+
+#Cp plot
+plot(top10_persize$size, top10_persize$Cp, xlab = "Model Size", ylab = expression(C[p]), main = "Mallows' Cp for Various Model Sizes")
+
+#Narrowed in Cp plot
+plot(top10_persize$size, top10_persize$Cp, xlab = "Model Size", ylab = expression(C[p]), ylim=c(min(top10_persize$Cp),median(top10_persize$Cp)), main = "Mallows' Cp (Zoomed In)")
+
+#Regressors present in 14-15 variable models
+colSums(top10_persize$which[131:150,])
+
+#Subset the dataset
+small <- baseball[ ,c('salary', 'PO', 'R', 'H', 'HR', 'RBI', 'BB', 'CAB', 'CH', 'CHR', 'CR', 'CBB', 'AB/year', 'H/year', 'HR/year', 'R/year', 'RBI/year', 'logyears', 'Free-agency eligible')]
+```
+
+The last table shows which of the regressors I'm considering are included in the 14-15 variable models. Since these seem to be the most important regressors, according to this method, I subsetted the dataset using these columns (that appear > 5 times) and perform further model selection on this basis. Although log(years) only shows up twice, I will include it as to lower my chances of violating the principle of marginality later on.
+
+In summary, Mallows's Cp helped us narrow down the number of variables to consider; we now only have 19 regressor variables as opposed to 35 before. Next, we can use BIC as criteria to choose some of the top models. It turns out that most models produced while including `Int2` violate the principle of marginality, since `logyears` was not included in many of those models; thus I decided to remove `Int2` and rerun the process. From the BIC plot we find the best models near the top, and can tell from the presence of black boxes which variables are present. The final chart serves a similar purpose, containing the ordered top 12 models (ranked by lowest BIC), variables included, and BIC value for each model. 
+
+```{r, fig.width=8, fig.height=7}
+#Top five models of size up to 10 variables
+subsets <- regsubsets(salary ~ ., data = small, nbest = 5, nvmax = 10, method = "exhaustive")
+
+#BIC plot
+plot(subsets, scale = "bic", main = "BIC for Top Models")
+
+#Top 12 models
+indexes <- rank(summary(subsets)$bic) #indexes of ordered BIC, lowest -> highest
+best <- summary(subsets)$which[indexes,] #reorder models based on BIC
+top12 <- best[1:12,] #take top 12 best models
+
+#Models, included variables, and BIC value
+cbind(top12 - 0, BIC = sort(summary(subsets)$bic)[1:12])
+```
+
+
+####Final Selection
+
+If the goal was prediction, I would favor a more complicated model. For model interpretability, I would favor a simpler model. I have decided to compromise by selecting the 9-variable model with lowest BIC, or the sixth row in our chart. **This model predicts player salary based on the number of home runs, walks, career runs, career walks, at bats per year, runs per year, runs batted in per year, logged career length (`logyears`), and  free-agency eligibility.** A quick examination shows that all of these coefficients are, fortunately, significant, and this model explains away about 70% of variation in our data.
+
+```{r}
+final_lm <- lm(salary ~ HR + BB + CR + CBB + `AB/year` + `R/year` + `RBI/year` + `logyears` + `Free-agency eligible`, data = baseball)
+summary(final_lm)
+```
+
+###Conclusion
+
+In this project, we have built a predictive and descriptive model of baseball player's salaries based on their performance stats. We have identified unusual data points, found appropriate variable transformations, and considered interactions between terms. In our final model, the number of walks, career runs, runs per year, runs batted in per year, and free-agency eligibility all contributed positively towards player salary. Negative contributors included (sometimes counterintuitively) the number of home runs, career walks, at bats per year, and logged years in major leagues. This 9-variable model explained away around 70% of the variation in our data, which is an incredible amount considering that our original 35-variable model had explained away only around 81% of it!
+
+###Credits
+
+A special thanks to Professor Nolan's class lecture slides for inspiration on many plotting and model selection functions, and examples of how to use certain functions that are similarly implemented here sporadically (e.g. in `scatterplotMatrix()`, `corrplot()`, `leaps()`, etc.).

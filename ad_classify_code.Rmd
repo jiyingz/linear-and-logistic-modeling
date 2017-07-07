@@ -1,0 +1,505 @@
+---
+title: "Internet Image Ad Classification"
+author: "A Predictive Model"
+date: "Jiying Zou"
+output: pdf_document
+---
+```{r, include = F}
+library(DataComputing)
+library(stats)
+library(leaps)
+library(car)
+library(cvTools)
+library(glmnet)
+```
+##Introduction
+
+Can an internet image be automatically identified as an ad based on observations? Such a question is important in today’s rapidly expanding marketing-related machine learning and algorithm development fields, for example in the creation of ad-blocker software. This report, through data investigation and regression methods, aims to build and compare various models, focusing on predictive power, classifying an image as an ad or not. Models examined are picked by principal component analysis (PCA), binomial LASSO regression, and combinations of the two. The model selected by LASSO surpasses the other models in performance, yielding about 95% cross validated prediction accuracy. 
+
+##Data Description
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Load data
+df <- read.csv("~/Documents/stat151/finalproj/ad.data", header = F, stringsAsFactors = F)
+
+#Which columns have NA's
+sum(grepl("?", df[1:4], fixed = TRUE))
+sum(grepl("?", df[5:1559], fixed = TRUE)) #no missing values
+
+#Modify all variables to be numeric, with NA's taking the place of "?"'s
+df$V1[grepl("?", df$V1, fixed = T)] = NA
+df$V2[grepl("?", df$V2, fixed = T)] = NA
+df$V3[grepl("?", df$V3, fixed = T)] = NA
+df$V4[grepl("?", df$V4, fixed = T)] = NA
+
+df$V1 <- as.numeric(df$V1)
+df$V2 <- as.numeric(df$V2)
+df$V3 <- as.numeric(df$V3)
+df$V4 <- as.numeric(df$V4)
+
+#Manipulate last column to be categorical 0/1
+colnames(df)[colnames(df) == "V1559"] <- "y" #rename response variable
+df$y <- (df$y == "ad.") - 0 #recode (ad = 1, not ad = 0)
+
+#Make sure all NA's are accounted for
+sum(is.na(df)) == sum(is.na(df[1:4]))
+```
+
+This dataset consists of 1558 measured explanatory variables for 3279 internet images, of which 458 are ads and 2821 are not. The explanatory variables contain 3 continuous and 1555 Bernoulli variables that take on 0/1 values. The continuous variables contain the image height, width, and aspect ratio measurements, but no details are known about what the Bernoulli variables represent besides that “1” means presence of and “0” means absence of some characteristic. Only the continuous and first Bernoulli variable have any missing values.
+
+In working with data, I treat the Bernoulli variables as numeric for simplicity. As for the continuous variables, all three are skewed, multimodal, and as seen from Figure 1(a), relatively correlated with one another with severe non-constant variance issues. Some problems are alleviated by transformations: logging the first variable, square root the second, and fourth root the third (Figure 1(b)).
+
+
+```{r, echo = FALSE, fig.width = 6, fig.height=3.5, fig.align='center'}
+#Pre-transformation scatterplot matrix
+scatterplotMatrix(df[c(1:3)], main = "Continuous Variables (Pre-Transformation)")
+```
+\begin{center}
+\footnotesize Figure 1(a).  Three continuous variables show considerable skew, multimodality, and non-constant variance in their pairs plots.
+\end{center}
+```{r, echo = FALSE, results = 'hide', warning = FALSE, fig.show='hide'}
+#Pre-transformation residual plot b/t V1 and V2
+prefit <- lm(V1 ~ V2, data = df)
+prefit_resids <- rstudent(prefit) #studentized residuals
+plot(prefit_resids ~ prefit$fitted.values, main = "V1 vs. V2 Residuals Plot (pre-transformation)", xlab = "Fitted Values", ylab = "Studentized Residuals")
+abline(h = 0, col = "red")
+abline(h = c(-2,2), lty = 2)
+
+#Post-Transformation Variable Histogram Plots
+hist(log(df$V1), breaks = 30, main = "Log V1 Histogram", xlab = "log(V1)")
+hist(sqrt(df$V2), breaks = 30, main = "Square Root V2 Histogram", xlab = "sqrt(V2)")
+hist((df$V3)^(1/4), breaks = 30, main = "Fourth Root V3 Histogram", xlab = "V3^(1/4)")
+
+#Apply transformations
+df$V1 <- log(df$V1)
+df$V2 <- sqrt(df$V2)
+df$V3 <- (df$V3)^(1/4)
+
+#Post transformation V1 vs V2 plot
+plot(df$V1, df$V2, main = "V1 vs. V2 Post-Transformations", xlab = "Log V1", ylab = "√V2")
+abline(h = 0, col = "red")
+abline(h = c(-2,2), lty = 2)
+
+#Post-transformation residual plot b/t V1 and V2
+postfit <- lm(V1 ~ V2, data = df)
+postfit_resids <- rstudent(postfit) #studentized residuals
+plot(postfit_resids ~ postfit$fitted.values, main = "Residuals Plot (post-transformation)", xlab = "Fitted Values", ylab = "Studentized Residuals")
+abline(h = 0, col = "red")
+abline(h = c(-2,2), lty = 2)
+```
+
+```{r, echo = FALSE, fig.width = 6, fig.height=3.5, fig.align='center'}
+#Post-Transformation scatterplot matrix
+scatterplotMatrix(df[c(1:3)], main = "Continuous Variables (Post-Transformation)")
+```
+\begin{center}
+\footnotesize Figure 1(b). After transformations, the variables are much better behaved -- some skew is fixed, and errors are a lot more consistent.
+\end{center}
+
+However, Figure 2 hints that non-ads are overrepresented in the missing data. Out of all cases, nearly 30% of non-ads yet only around 15% of ads lack all three continuous values. Thus, without information on missing value explanations, I remove the continuous variables for fear that they might skew the predictions later on.
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Columns with NA values
+which(is.na(colMeans(df)))
+
+#Missing data in continuous vars
+cont_missing <- which(is.na(df$V1) & is.na(df$V2) & is.na(df$V3)) #index of cols that have all 3 continuous vars missing
+length(cont_missing)/nrow(df)
+
+length(cont_missing) == length(which(is.na(df$V1) | is.na(df$V2) | is.na(df$V3))) #there are more missing values!!!
+
+#Is missing data disproportionately represented in 0/1 outcome?
+tally(df$y) #overall outcome count
+props_missing <- as.numeric(tally(df$y[cont_missing])/tally(df$y)) #proportion of each outcome missing
+props_missing
+```
+
+```{r, echo = FALSE, fig.width = 6.5, fig.height = 5, fig.align = 'center'}
+barplot(props_missing, main = "Proportion of Continuous Variable Data Missing for Outcomes", xlab = "Outcome", ylab = "Proportion of Data Missing ", names.arg = c("Non-ad","Ad"), ylim = (0:1/2))
+```
+
+\begin{center}
+\footnotesize Figure 2. Around 30\% of non-ad cases having missing continuous variable data, while only around 15\% of ad cases are missing this information.
+\end{center}
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Remove rows missing continuous data
+df <- df[ , -c(1:3)]
+
+#Remove last NA's from V4=NA
+v4_na <- which(is.na(df$V4))
+length(v4_na)
+df <- df[-v4_na, ]
+
+#Any more NA's
+which(is.na(df))
+dim(df)
+```
+
+\newpage
+For the remaining Bernoulli variables, I remove 795 duplicated columns to avoid perfect collinearity, and weed out the leftover 15 cases containing missing values, which can be safely ignored in the grand scope of 3000+ other observations. Given that the remaining 760 variables consist mostly of zeroes, collinearity is still a crucial problem in model building and selection. 
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Weed out duplicated columns
+dup <- which(duplicated(t(df[,-1556])))[-1] #keep one unique col
+print(paste("There are", length(dup) + 1, "nonunique binary columns!"))
+
+#Remove duplicates/collinear cols
+df <- df[ ,-dup] 
+dim(df)
+```
+
+```{r, echo = FALSE, fig.width = 5.5, fig.height = 4, fig.align = 'center'}
+#Plot mean of each 0/1 variable left (pi)
+plot(colMeans(df[, -761]), main = "Pi (Probability of 1) of Variables", xlab = "Variable", ylab = expression(hat(pi[i])), xaxt = 'n')
+abline(h = 0.025, col = "red", lty = 2)
+```
+
+\begin{center}
+\footnotesize Figure 3. Only a couple Bernoulli (0/1) variables contain more than 2.5\% of "1"'s; most explanatory variables contian mostly "0"'s.
+\end{center}
+
+Finally, the rows are shuffled randomly to eliminate any patterns, and the first 250 cases are set aside as the test set.
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Shuffle rows
+df <- df[sample(nrow(df)), ]
+
+#Train test split
+test <- df[1:250, ] #test set (don't touch until end)
+df <- df[251:nrow(df), ] #train set (rest of data)
+sum(test$y == 1)/nrow(test) #proportion of test set images that are ads
+```
+
+\newpage
+##Main Results
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+##UNUSED MODEL 
+
+#Select variables with more than 2.5% 1's
+#mod1_nonnegl <- names(which((colMeans(df[,-761]) > 0.025))) #names of non-negligible variables
+
+#mod1_summ <- summary(glm(y ~ ., data = df[,c(mod1_nonnegl, "y")], family = "binomial"))
+#mod1_summ
+
+#Significant coefficients
+#mod1_coeffs <- rownames(mod1_summ$coefficients[which(mod1_summ$coefficients[,4] < 0.05), ])[-1]
+#mod1_coeffs
+
+#summary(glm(y ~ ., data = df[,c(mod1_coeffs, "y")], family = "binomial"))
+#length(mod1_nonnegl)
+
+#Top 5 models per size
+#mod1_top5 <- regsubsets(x = df[ ,mod1_nonnegl], y = df$y, nbest = 5, nvmax = 35, intercept = F, really.big = T, method = "exhaustive")
+
+#BIC plot
+#plot(mod1_top5, scale = "bic", main = "BIC for Top Models")
+
+#Top model
+#mod1_indexes <- rank(summary(mod1_top5)$bic) #indexes of ordered BIC, lowest -> highest
+#mod1_reorderedbic <- summary(mod1_top5)$which[mod1_indexes,] #reorder models based on BIC
+#mod1_top <- names(mod1_reorderedbic[1, ]) #names of vars in top model
+#print(paste("Top model judged by BIC has", length(mod1_top), "variables."))
+```
+
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE, fig.show='hide'}
+#MODEL 1 -- PCA ONLY
+###**Note: mod2 is model 1 in the report, mod3 is model 2, and so on, since I didn't end up using first model
+
+#PCA
+mod2_yvec <- which(colnames(df) == "y") #which column is y
+mod2_pca <- prcomp(df[,-mod2_yvec])
+
+#Data frame with each principle component (columns) and coefficients for variables (rows)
+mod2_rotations <- data.frame(mod2_pca$rotation)
+
+#Plot to see how many PC's needed
+screeplot(mod2_pca, type = "lines", main = "Model 2 PCA Screeplot")
+
+#Summary of magnitude of coefficients
+summary(abs(mod2_rotations[,1]))
+summary(abs(mod2_rotations[,2]))
+summary(abs(mod2_rotations[,3]))
+summary(abs(mod2_rotations[,4]))
+summary(abs(mod2_rotations[,5]))
+
+#Variables kept (find all unique variable names that meet criteria)
+mod2_varskept_pca <- c()
+for(i in 1:5) {
+  mod2_varskept_pca <- c(mod2_varskept_pca, rownames(mod2_rotations[which(abs(mod2_rotations[,i]) > 0.05),])) #append variables matching criteria for first 5 principle components
+}
+mod2_varskept_pca <- unique(mod2_varskept_pca)
+
+#Model size
+length(mod2_varskept_pca)
+
+#Subset data on principle components
+mod2_df_small <- df[,c(mod2_varskept_pca,"y")]
+dim(mod2_df_small)
+mod2_ycol <- which(colnames(mod2_df_small) == "y") #y column index
+mod2_pca_small <- prcomp(mod2_df_small[,-mod2_ycol])
+
+#Condition indexes
+mod2_cond_ind <- mod2_pca_small$sdev[1]/mod2_pca_small$sdev
+sum(mod2_cond_ind > 10)
+```
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE, fig.show = 'hide'}
+#MODEL 2 -- PCA + LASSO
+
+#Lasso & Cross-Validation
+mod2_df_small <- as.matrix(mod2_df_small)
+mod3_lasso_reg <- glmnet(x = mod2_df_small[,1:(mod2_ycol-1)], y = mod2_df_small[,mod2_ycol], family = "binomial", standardize = F)
+mod3_lasso_cv <- cv.glmnet(x = mod2_df_small[,1:(mod2_ycol-1)], y = mod2_df_small[,mod2_ycol], family = "binomial", nfolds = 5, type.measure = "auc", keep = TRUE)
+
+#Lambda minimizing MSE
+plot(mod3_lasso_cv)
+
+#Shrinkage plot of coefficients
+plot(mod3_lasso_reg, xvar = "lambda")
+abline(v = log(mod3_lasso_cv$lambda.min), lty = 2)
+abline(h = 0)
+
+#Optimal lambda value, and corresponding CV MSE
+mod3_min_lambda <- mod3_lasso_cv$lambda.min
+mod3_min_lambda
+mod3_lasso_cv$cvm[which(mod3_lasso_cv$lambda == mod3_min_lambda)]
+
+###Found the lambda that minimizes the AUC using CV. 5 and 10-fold cross-validation came around with about the same mean MSE, so I chose 5 in favor of a smoother fit with less variance but higher bias. The CV MSE was about 0.06. 
+
+#Subset coefficients that aren't zeroed out
+mod3_opt_lambda_coeffs <- data.frame(as.matrix(coef(mod3_lasso_cv, s = "lambda.min"))) #list of coefficient values
+mod3_nonzero_coefs <- case.names(mod3_opt_lambda_coeffs)[which(!(mod3_opt_lambda_coeffs$X1 == 0))] #names of nonzero coefficients
+mod3_nonzero_coefs <- mod3_nonzero_coefs[-1] #remove intercept name
+length(mod3_nonzero_coefs) #number of nonzero remaining coeffs
+```
+
+Under the motivation of higher predictive power, I chose two main tools, PCA and binomial LASSO, to build four models with. The first model solely uses PCA to reduce collinearity, and the second follows up the results from the first with binomial LASSO regression to further reduce dimensionality. The order is then reversed, and the third model uses binomial LASSO by itself while the fourth model follows up the third with PCA. Binomial LASSO is implemented using the `glmnet` package, and the optimal penalty term is chosen by 5-fold cross validation based on AUC error. 
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#MODEL 3 -- LASSO ONLY
+
+#Lasso & Cross-Validation to find lambda
+mod4_df <- as.matrix(df)
+dim(mod4_df)
+mod4_ycol <- which(colnames(mod4_df) == "y") #y column index
+mod4_lasso_reg <- glmnet(x = mod4_df[,1:(mod4_ycol-1)], y = mod4_df[,mod4_ycol], family = "binomial", standardize = F)
+mod4_lasso_cv <- cv.glmnet(x = mod4_df[,1:(mod4_ycol-1)], y = mod4_df[,mod4_ycol], family = "binomial", nfolds = 5, type.measure = "auc", keep = TRUE)
+```
+
+```{r, echo = FALSE, fig.width = 6, fig.height = 4, fig.align = 'center'}
+#Lambda minimizing MSE
+plot(mod4_lasso_cv, xlab = "Log Lambda")
+```
+
+\begin{center}
+\footnotesize Figure 4. The optimal L1-penalty term $\lambda$ is selected through AUC error, and resides at the highest point between these lines.
+\end{center}
+
+LASSO regression has the effect of driving some coefficients to zero:
+
+```{r, echo = FALSE, fig.width = 6, fig.height = 3.5, fig.align = 'center'}
+#Shrinkage plot of coefficients
+plot(mod4_lasso_reg, xvar = "lambda")
+abline(v = log(mod4_lasso_cv$lambda.min), lty = 2)
+abline(h = 0)
+```
+
+\begin{center}
+\footnotesize Figure 5. Each colored line represents a different coefficient's value. As the penalty increases, some coefficients are driven to zero, thus reducing dimensionality.
+\end{center}
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Optimal lambda value, and corresponding CV MSE
+mod4_min_lambda <- mod4_lasso_cv$lambda.min
+mod4_min_lambda
+mod4_lasso_cv$cvm[which(mod4_lasso_cv$lambda == mod4_min_lambda)]
+
+#Subset coefficients that aren't zeroed out
+mod4_opt_lambda_coeffs <- data.frame(as.matrix(coef(mod4_lasso_cv, s = "lambda.min"))) #list of coefficient values
+mod4_nonzero_coefs <- case.names(mod4_opt_lambda_coeffs)[which(!(mod4_opt_lambda_coeffs$X1 == 0))] #names of nonzero coefficients
+mod4_nonzero_coefs <- mod4_nonzero_coefs[-1] #remove intercept name
+length(mod4_nonzero_coefs) #number of nonzero remaining coeffs
+```
+
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE, fig.show = 'hide'}
+#MODEL 4 -- LASSO + PCA
+
+#PCA on LASSO selected coeffs
+mod5_dfsmall <- df[,mod4_nonzero_coefs] #subset on selected coeffs
+mod5_pca <- prcomp(mod5_dfsmall)
+
+#Evaluate collinearity w/ condition indexes
+mod5_cond_ind <- mod5_pca$sdev[1]/mod5_pca$sdev
+sum(mod5_cond_ind > 10)
+
+#Screeplot
+screeplot(mod5_pca, type = "lines", main = "Model 5 PCA Screeplot") #look for "elbow"
+
+#Variable loadings
+mod5_rotations <- data.frame(mod5_pca$rotation)
+
+#Summary of magnitude of coefficients
+summary(abs(mod5_rotations[,1]))
+summary(abs(mod5_rotations[,2]))
+summary(abs(mod5_rotations[,3]))
+summary(abs(mod5_rotations[,4]))
+
+#Variables kept (find all unique variable names that meet criteria)
+mod5_varskept_pca <- c()
+for(i in c(1:4)) {
+  mod5_varskept_pca <- c(mod5_varskept_pca, rownames(mod5_rotations[which(abs(mod5_rotations[,i]) > 0.2),])) #append variables matching criteria for first 5 principle components
+}
+mod5_varskept_pca <- unique(mod5_varskept_pca)
+length(mod5_varskept_pca)
+```
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#PREDICTION ERROR
+
+#RMSE function
+rmse <- function(pred, actual){
+  sqrt(mean((pred - actual)^2))
+}
+
+test_yind <- ncol(test) #index of test set y col
+
+#PCA (rank-deficient still!) 
+mod2_glm <- glm(y ~ ., data = df[,c(mod2_varskept_pca, "y")], family = "binomial")
+mod2_pred <- predict.glm(mod2_glm, newdata = test[,-test_yind], type = "response")
+mod2_rmse <- rmse(pred = mod2_pred, actual = test$y)
+
+#PCA + Lasso
+sub_test <- as.matrix(test[,mod2_varskept_pca]) #subset test set on selected columns
+mod3_pred <- predict(object = mod3_lasso_reg, newx = sub_test, s = mod3_min_lambda, type = "response")
+mod3_rmse <- rmse(pred = mod3_pred, actual = test$y)
+
+#Lasso
+mod4_pred <- predict(object = mod4_lasso_reg, newx = as.matrix(test[,-test_yind]), s = mod4_min_lambda, type = "response")
+mod4_rmse <- rmse(pred = mod4_pred, actual = test$y)
+
+#Lasso + PCA
+mod5_glm <- glm(y ~ ., data = df[,c(mod5_varskept_pca, "y")], family = "binomial")
+mod5_pred <- predict.glm(mod5_glm, newdata = test[,-test_yind], type = "response")
+mod5_rmse <- rmse(pred = mod5_pred, actual = test$y)
+```
+
+
+The resulting variables kept in each model are then extracted and fitted with coefficients in a general linear model (if no LASSO-provided coefficients are available), which is used to predict on the test set. The models contain 43, 27, 316, and 13 variables, respectively. (These numbers may alter slightly during compilation, depending on the train-test arbitrary split.) Root-mean-squared prediciton error (RMSE) is the criteria used to assess model competency.
+
+
+
+```{r, echo = FALSE, fig.align='center'}
+#Table of results
+methodnames <- c("PCA only", "PCA + LASSO", "LASSO only", "LASSO + PCA")
+methodrmses <- c(mod2_rmse, mod3_rmse, mod4_rmse, mod5_rmse)
+finalresults <- data.frame("Method" = methodnames, "RMSE" = methodrmses)
+finalresults
+```
+
+\begin{center}
+\footnotesize Table 1. Four different types of models and their respective RMSE errors when predicting on the test set.
+\end{center}
+
+```{r, echo = FALSE, results = 'hide', warning = FALSE}
+#Cross-validate PCA model
+df <- rbind(test, df)
+
+folds <- cvFolds(nrow(df), K = 5, type = "random") #split cases into 5 folds
+pca_accuracies <- c() #percentage 0/1 correctly predicted
+for(i in 1:5){
+  ind = which(folds$which == i) #fold i
+  testfold = df[ind, ] #test set
+  trainfold = df[-ind, ] #training set
+  fit = glm(y ~ ., data = trainfold[ ,c(mod2_varskept_pca, "y")], family = "binomial") #fit coefficients
+  pred = predict.glm(fit, newdata = testfold[ ,-ncol(testfold)], type = "response")
+  predicted = (pred >= 0.5) - 0 #predicted 0/1 values
+  correct = sum(predicted == testfold$y)/nrow(testfold) #Prediction accuracy
+  pca_accuracies <- c(pca_accuracies, correct)
+}
+#accuracies
+mean(pca_accuracies)
+
+#Cross-validate LASSO model
+
+lasso_accuracies <- c() #percentage 0/1 correctly predicted
+for(i in 1:5){
+  ind = which(folds$which == i) #fold i
+  testfold = df[ind, ] #test set
+  trainfold = df[-ind, ] #training set
+  fit = glm(y ~ ., data = trainfold[ ,c(mod4_nonzero_coefs, "y")], family = "binomial") #fit coefficients
+  pred = predict.glm(fit, newdata = testfold[ ,-ncol(testfold)], type = "response")
+  predicted = (pred >= 0.5) - 0 #predicted 0/1 values
+  correct = sum(predicted == testfold$y)/nrow(testfold) #Prediction accuracy
+  lasso_accuracies <- c(lasso_accuracies, correct)
+}
+#accuracies
+mean(lasso_accuracies)
+```
+
+The best of the four models is the model with LASSO regression only, which yielded the lowest RMSE and a cross-validated prediction accuracy of around 95%! The variables kept are as follows:
+
+```{r, echo = FALSE}
+print("The variables present in the final model are: ") 
+mod4_nonzero_coefs
+```
+
+This result is surprising, since I hypothesized that the PCA model would perform the best due to its collinearity reducing properties. LASSO regression aims to minimize the size of the regressor coefficients and operates off of the $L_1$-penalty, but does not intrinsically regulate collinearity. A possible explanation is that the PCA model has almost triple the number of variables as the LASSO model does, allowing for a much larger collinearity issue. Condition indexes generated from PCA confirm this idea – a good proportion of condition indexes are greater than the threshold (>10), indicating strong lingering collinearity. In addition, the PCA model yields separability issues causing the `glm()` fit to fail to converge. Separability issues cause estimated coefficients to be large and wildly inaccurate, which then interferes heavily with model stability.
+
+##Discussion 
+
+Subjectivity of model selection means that no model is “correct”; there are many possible methods beyond those I've implemented. I focus on PCA and LASSO specifically because these methods address collinearity and zero-out coefficients, respectively, effectively reducing dimensionality. Considering the large amount of variables, stepwise methods are computationally expensive for little gain, ridge regression will fail to zero out any coefficients at all, and without a doubt it is unrealistic to perform model selection by hand. Another model I attempted is motivated by the fact that only a handful of Bernoulli explanatory variables have a non-negligible proportion of “1”’s. Referencing back to Figure 3, this model selects variables with more than 2.5% of “1”’s, and uses BIC criteria to select a model from the five top models of each size up to 35 variables. While at first sight this method seems clever, in retrospect the method selects variables without guaranteed importance and fails to address collinearity. Another idea is to create the design matrix from the first few principal component vectors. This has the advantage of eliminating collinearity, since the design matrix will be orthogonal. 
+
+My final model is built upon assumptions of reasonable sampling methods, independently sampled images, and correct image judgement and data entry (implying no human error). This model has strong predictive power but weak interpretability, since no variable names are known, and there are a comparatively large number of variables. Although the original data is imbalanced in the amount of ad and non-ad outcomes, the predictive power is still fairly strong, indicating that the model performs well in predicting both outcomes. Predictive power may be improved by considering the three continuous variables, perhaps making up for the large amount of missing data with conditional imputation methods (i.e. fill in missing values from cases with a specific outcome with the mean of all cases with that outcome). 
+
+Regarding test set prediction error, RMSE is a more robust measure than percentage of correct predictions because it weighs in each model’s probability of obtaining specific predictions and is not based on arbitrary cutoff values from which prediction outcomes are decided. A downside of my error comparisons is that I examined the RMSE of all models, while LASSO may be better compared through mean absolute error (MAE). 
+
+##Summary
+
+It is possible to predict whether or not an internet image is an advertisement with high accuracy through a model built from its characteristics. A 316-variable LASSO regression-only model yields the highest predictive power out of all the various approaches considered in this report. This model generates a cross-validated 95% prediction accuracy, but by no means is it the best model. Although this method gains legitimacy over others, many improvements can be made to enhance predictive power.
+
+\newpage
+##References
+
+Packages used:
+
+* `DataComputing` -- for various methods: http://data-computing.org/accessing-data-computing-data-and-software/
+
+* `stats` -- for various methods: https://stat.ethz.ch/R-manual/R-devel/library/stats/html/00Index.html
+
+* `leaps` -- for `leaps()` and `regsubsets()` exhaustive search: https://cran.r-project.org/web/packages/leaps/leaps.pdf
+
+* `car` -- for various methods: https://cran.r-project.org/web/packages/car/index.html
+
+* `cvTools` -- for cross-validation at the end: https://cran.r-project.org/web/packages/cvTools/cvTools.pdf
+
+* `glmnet` -- for binomial LASSO regression and cross-validation: ftp://debian.ustc.edu.cn/CRAN/web/packages/glmnet/glmnet.pdf
+
+Lecture slides (from Professor Deborah Nolan) consulted:
+
+* PCA.html -- for PCA-related code
+
+* ModelSelection.html -- for Cp/AIC/BIC comparisons as criteria, and for `leaps()`, `regsubsets()`, and stepwise selection code
+
+Lab examples (from Omid Solari) referenced:
+
+* Lab 0419 -- for LASSO graphs and decision on RMSE error model competency measure
+
+Textbooks:
+
+* John Fox's *Applied Regression Analysis & Generalized Linear Models, Third Edition*
+
++ Section 14.5, on the topic of separability issues
+
++ Section 20.2, on the topic of dealing with missing data
+
+Notes taken in class:
+
+* On the topics of collinearity, PCA, cross-validation, model selection, AIC/BIC, ridge and LASSO regression, logistic regression, and generalized linear models
+
+Note: Some of this code was taken from my own implementation of HW5 about baseball data analysis.
+
+A huge thank you to Professor Nolan and Omid Solari for helping me debug throughout the project!
